@@ -3,19 +3,20 @@
 # @Time    : 2018/12/10 14:04
 # @Author  : cbdeng
 # @Software: PyCharm
-from datetime import datetime
+import datetime
 from peewee import SQL,DateTimeField
 import time
 from common_lib.db.mysql import get_db
 from common_lib.common_func import g_mylogging
-from common_lib.utils.utils import get_dtstr_by_ts
-from common_lib.utils.common_exception import no_login_err,dup_err,auth_err,req_format_err,no_func_err,forbid_err
+from common_lib.utils.utils import get_dtstr_by_ts,get_ts8dt
+from common_lib.utils.common_exception import no_login_err,dup_err,auth_err,req_format_err,no_func_err,forbid_err,no_res_err
 from playhouse.shortcuts import model_to_dict
 from common_lib.db.mysql import mu_catch
-from common_lib.utils.utils import is_date
+from common_lib.utils.utils import is_date,str_is_int
+from common_lib.utils.rule import rule_check,rule_check_v2
 logging = g_mylogging
 
-oper_list = ["query","insert","update","delete"]
+g_oper_list = ["query","insert","update","delete","query_one"]
 import json
 g_test = 0
 
@@ -27,6 +28,7 @@ class MysqlUtil():
         self.dt_trans = dt_trans
         self.admin_end = admin_end
 
+    @rule_check_v2
     def handler(self,input_dict):
         # flag
         self.self_check_flag = False
@@ -37,6 +39,12 @@ class MysqlUtil():
         if self.input_dict["ent"] not in self.db_dict:
             raise Exception("[MysqlUtil]ent err")
         self.Ins = self.db_dict[self.input_dict["ent"]]["model"]
+        self.version = 0
+        self.get_dict = {}
+        if "get_dict" in input_dict:
+            self.get_dict = input_dict["get_dict"]
+            if "version" in self.get_dict and str_is_int(self.get_dict["version"]):
+                self.version = int(self.get_dict["version"])
         self.ent_dict = self.db_dict[self.input_dict["ent"]]
         self.before_handler()
         res = self.mid_handler()
@@ -53,11 +61,12 @@ class MysqlUtil():
         if callable(invert_op):
             res = invert_op(self)
         else:
-            if self.input_dict["oper"] in oper_list:
+            if self.input_dict["oper"] in g_oper_list:
                 comm_op = getattr(self, self.input_dict["oper"])
                 if callable(comm_op):
                     res = comm_op()
                 else:
+                    logging.warning("[mid_handler]no_func_err %s" % (self.input_dict,))
                     raise no_func_err
             else:
                 raise no_func_err
@@ -77,7 +86,9 @@ class MysqlUtil():
                     raise no_login_err
             else:
                 the_err = None
-                for item in self.ent_dict["auth_oper_list"]:
+                auth_oper_list = self.ent_dict["auth_oper_list"]
+                aplen = len(auth_oper_list)
+                for index,item in enumerate(auth_oper_list):
                     if item["oper_list"] == "all" or self.input_dict["oper"] in item["oper_list"]:
                         if "need_auth" in item and not item["need_auth"]:
                             the_err = None
@@ -94,8 +105,15 @@ class MysqlUtil():
                             else:
                                 the_err = auth_err
                     else:
-                        if not self.uinfo_res:
-                            raise no_login_err
+                        # 遍历到最后一个oper_list，oper依然不存在
+                        if index == aplen-1 and not self.uinfo_res:
+                            the_err = no_login_err
+                            break
+                        # if index == len(self.ent_dict["auth_oper_list"])-1 and not self.uinfo_res:
+                        #     raise no_login_err
+                        # 方法可能藏在后面
+                        # if self.input_dict["oper"] not in g_oper_list and self.input_dict["oper"] not in item["oper_list"]:
+                        #     raise no_func_err
 
                 if the_err:
                     raise the_err
@@ -112,12 +130,42 @@ class MysqlUtil():
                     if "after_handler" in item:
                         res = item["after_handler"](self.input_dict["info"])
 
+    def query_one(self):
+        info_dict = self.input_dict["info"]
+        flag = {}
+        cond = info_dict.pop('ct_where', None)
+
+        db = get_db()
+        if self.self_check_flag:
+            q1 = " %s = %s" % (self.ent_dict["uid_name"], self.uinfo_res["id"])
+            if cond:
+                cond = cond + " and %s " % q1
+            else:
+                cond = q1
+        try:
+            all_res = self.Ins.select().where(SQL(' %s ' % cond)).dicts()
+            for item in all_res:
+                if self.dt_trans:
+                    for key, item1 in item.items():
+                        if type(item1) == datetime.datetime :
+                            item[key] = int(time.mktime(item1.timetuple()))
+                        elif item1 == "0000-00-00 00:00:00":
+                            item[key] = 0
+                flag = item
+                break
+        except Exception as e:
+            logging.exception("[query_one]%s" % e)
+            db.rollback()
+        if not flag:
+            raise no_res_err
+        return flag
+
+
     def query(self):
         info_dict = self.input_dict["info"]
         index = 0
         count = 10
         offset = 0
-
         final_res = {
             "data_list": [],
             "offset": offset,
@@ -150,6 +198,11 @@ class MysqlUtil():
             # where
             if self.admin_end:
                 sql_where = ""
+                if "cond_like_list" in info_dict:
+                    for item in info_dict["cond_like_list"]:
+                        the_field = getattr(self.Ins, item["field_name"])
+                        myquery = myquery.where(the_field.contains(item["data"]))
+                # print(myquery)
                 if "where" in info_dict:
                     sql_where = info_dict["where"]
                 if self.self_check_flag:
@@ -161,49 +214,83 @@ class MysqlUtil():
                 if sql_where:
                     myquery = myquery.where(SQL('%s' % sql_where))
             final_res["total_count"] = myquery.count()
-            if "order_by" in info_dict:
+            if "order_by" in info_dict and len(info_dict["order_by"])==1:
+                olist = []
                 for item in info_dict["order_by"]:
                     attr = getattr(self.Ins,item["field"])
-                    myquery = myquery.order_by(getattr(attr,item["sort"])())
+                    olist.append(getattr(attr,item["sort"])())
+                myquery = myquery.order_by(*olist)
             myquery = myquery.offset(offset).limit(count).dicts()
             for item in myquery:
                 tmp_dict = item
                 # dt_trans
                 if self.dt_trans:
                     for key, item1 in tmp_dict.items():
-                        if type(item1) == datetime:
+                        if type(item1) == datetime.datetime:
                             tmp_dict[key] = int(time.mktime(item1.timetuple()))
                 final_res["data_list"].append(tmp_dict)
                 index += 1
         elif sql and count_sql:
             db = get_db()
             if self.admin_end:
-                if "where" in info_dict:
-                    sql = sql + " where " + info_dict["where"]
+                if "where" in info_dict and info_dict["where"]:
+                    if "where" in sql:
+                        sql = sql + " and " + info_dict["where"]
+                    else:
+                        sql = sql + " where " + info_dict["where"]
+                    if "where" in count_sql:
+                        count_sql = count_sql + " and " + info_dict["where"]
+                    else:
+                        count_sql = count_sql + " where " + info_dict["where"]
+            cond_like_list = []
+            if "cond_like_list" in info_dict:
+                for item in info_dict["cond_like_list"]:
+                    if "where" in sql:
+                        sql = sql + " and " + item["field_name"] + " like %s"
+                    else:
+                        sql = sql + " where " + item["field_name"] + " like %s"
+                    if "where" in count_sql:
+                        count_sql = count_sql + " and " + item["field_name"] + " like %s"
+                    else:
+                        count_sql = count_sql + " where " + item["field_name"] + " like %s"
+                    cond_like_list.append("%"+item["data"]+"%")
             if "order_by" in info_dict and info_dict["order_by"]:
                 sql = sql + " order by "
                 for item in info_dict["order_by"]:
-                    sql = sql+ " " +item["field"] + " " + item["sort"]
-            res = db.execute_sql(count_sql)
+                    sql = sql+ " " +item["field"] + " " + item["sort"] + ","
+                sql = sql.strip(",")
+            # print("dd",sql,count_sql,cond_like_list)
+            res = db.execute_sql(count_sql,cond_like_list)
             final_res["total_count"] = res.fetchone()[0]
             sql = sql + " limit %s,%s" % (offset,count)
-            cursor = db.execute_sql(sql)
-            db.close()
+            cursor = db.execute_sql(sql,cond_like_list)
             field_list = []
             if "field" in info_dict:
                 field_list = info_dict["field"]
-            for row in cursor.fetchall():
-                index += 1
-                if field_list and len(row)!=len(field_list):
-                    raise req_format_err
-                tmp = {}
-                if field_list:
-                    for key,item in enumerate(field_list):
-                        tmp[item] = row[key]
-                else:
-                    for key,item in enumerate(row):
-                        tmp[key] = row[key]
-                final_res["data_list"].append(tmp)
+            if field_list:
+                for row in cursor.fetchall():
+                    index += 1
+                    if field_list and len(row)!=len(field_list):
+                        raise req_format_err
+                    tmp = {}
+                    if field_list:
+                        for key,item in enumerate(field_list):
+                            tmp[item] = row[key]
+                    else:
+                        for key,item in enumerate(row):
+                            tmp[key] = row[key]
+                    final_res["data_list"].append(tmp)
+            else:
+                for row in cursor.fetchall():
+                    index += 1
+                    table = dict()
+                    for column, value in zip(cursor.description, row):
+                        column_name = column[0]
+                        if type(value) == datetime.datetime:
+                            value = get_ts8dt(value)
+                        table[column_name] = value
+                    final_res["data_list"].append(table)
+            db.close()
         else:
             raise req_format_err
         #  count
@@ -216,7 +303,7 @@ class MysqlUtil():
         final_res["total_page"] = tp
         return final_res
 
-    def insert(self):
+    def insert(self,force=False):
         flag = None
         info_dict = self.input_dict["info"]
         db = get_db()
@@ -229,16 +316,20 @@ class MysqlUtil():
             ct_field = info_dict.pop('ct_field', None)
             for key,item in self.Ins._meta.fields.items():
                 if type(item) == DateTimeField:
-                    if key not in info_dict:
+                    if key not in info_dict and key in ["update_time"]:
                         info_dict[key] = get_dtstr_by_ts()
-            flag,created = self.Ins.get_or_create(**info_dict)
+            if not force:
+                flag,created = self.Ins.get_or_create(**info_dict)
+            else:
+                created = True
+                flag = self.Ins.create(**info_dict)
             # for key,item in self.Ins._meta.fields.items():
             #     val = getattr(flag,key)
             #     print(type(val))
             flag = model_to_dict(flag)
             for key,item in flag.items():
                 if key in ["update_time","create_time"]:
-                    flag[key] = int(time.mktime(datetime.strptime(item, "%Y-%m-%d %H:%M:%S").timetuple()))
+                    flag[key] = get_ts8dt(item)
             tmp = {}
             if ct_field:
                 for key,item in flag.items():
@@ -261,7 +352,10 @@ class MysqlUtil():
         # pk_val =info_dict["pk_val"]
         # Ins_pk = getattr(self.Ins,pk_field)
         flag =None
-        cond = info_dict.pop('where', None)
+        cond = info_dict.pop('ct_where', None)
+        for key, item in self.Ins._meta.fields.items():
+            if type(item) == DateTimeField and key in ["update_time"] and key not in info_dict:
+                info_dict[key] = get_dtstr_by_ts()
 
         db = get_db()
         if self.self_check_flag:
@@ -271,13 +365,14 @@ class MysqlUtil():
             else:
                 cond = q1
         try:
+            # print(info_dict,cond)
             flag = self.Ins.update(**info_dict).where(SQL(' %s ' % cond)).execute()
             if self.self_check_flag and not flag:
                 raise auth_err
         except Exception as e:
             logging.exception("[update]%s" % e)
             db.rollback()
-        return flag
+        return {"eff_num":flag}
 
 
     def delete(self):

@@ -43,7 +43,7 @@ def send2mq(info,push_type=0,ttl=1):
         g_stdlogging.info("[send2mq] %s %s" % (new_info,ttl))
         res = delay_channel.basic_publish(exchange='',routing_key=push_delay_queue,body=json.dumps(new_info),properties=pt)
     except Exception as e:
-        g_stdlogging.exception("[send2mq]err %s " % e)
+        g_stdlogging.error("[send2mq]err %s " % e)
 
 
 import jpush

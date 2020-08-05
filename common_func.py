@@ -105,6 +105,7 @@ def lru_cache(max_len=10000, exclude_list=[]):
     return decorator
 
 
+
 def get_config(rel_path=""):
     """
     加载配置文件

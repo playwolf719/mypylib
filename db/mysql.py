@@ -19,11 +19,11 @@ def get_db():
         database = get_new_db()
     return database
 
-def get_new_db():
+def get_new_db(max_connections=20):
     global database
     m_dict = g_conf["mysql"]
     # database = MySQLDatabase(m_dict["dbname"], **{'host': m_dict["host"], "passwd":m_dict["password"], 'port': int(m_dict["port"]), 'user': m_dict["uname"]})
-    database = PooledMySQLDatabase(database='dociee', host=m_dict["host"], port=int(m_dict["port"]),user=m_dict["uname"], passwd=m_dict["password"],stale_timeout=300 )
+    database = PooledMySQLDatabase(database=m_dict["database"], host=m_dict["host"], port=int(m_dict["port"]),user=m_dict["uname"], passwd=m_dict["password"],stale_timeout=300, charset="utf8mb4",max_connections=max_connections)
     return database
 
 class BaseModel(Model):
@@ -49,8 +49,9 @@ def mu_catch():
             except Exception as e:
                 ins._meta.database.close()
                 ins._meta.database = get_new_db()
-                g_stdlogging.exception("[model_cls_catch] %s %s" % (func.__name__,e))
+                raise e
             ins._meta.database.close()
             return res
         return wrapper
     return decorator
+
